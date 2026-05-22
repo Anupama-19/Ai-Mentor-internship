@@ -5,16 +5,21 @@ import datetime
 import re
 import traceback
 import asyncio
+import requests
+
 from elevenlabs.client import ElevenLabs
 import cloudinary
 import cloudinary.uploader
+
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from google import genai
+
+# --------------------------
+# Cloudinary Config
+# --------------------------
 from config import (
-    GEMINI_API_KEY,
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET,
@@ -22,9 +27,6 @@ from config import (
     ELEVENLABS_VOICE_ID,
 )
 
-# --------------------------
-# Cloudinary Config
-# --------------------------
 cloudinary.config(
     cloud_name=CLOUDINARY_CLOUD_NAME,
     api_key=CLOUDINARY_API_KEY,
@@ -46,12 +48,10 @@ app.add_middleware(
 )
 
 # --------------------------
-# Gemini Client
+# ElevenLabs Client
 # --------------------------
-client = genai.Client(api_key=GEMINI_API_KEY)
-eleven_client = ElevenLabs(
-    api_key=ELEVENLABS_API_KEY
-)
+eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+
 # --------------------------
 # Request Model
 # --------------------------
@@ -59,13 +59,50 @@ class LessonRequest(BaseModel):
     course: str
     topic: str
     celebrity: str
-    preferences: dict | None = None   # 👈 NEW
+    preferences: dict | None = None
 
 # --------------------------
-# Helpers
+# Base Path
 # --------------------------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# --------------------------
+# Hugging Face AI Function
+# --------------------------
+def call_huggingface(prompt):
+    try:
+        url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+
+        headers = {
+            "Authorization": f"Bearer {os.getenv('HF_API_KEY')}"
+        }
+
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": 200,
+                "temperature": 0.7
+            }
+        }
+
+        response = requests.post(url, headers=headers, json=payload)
+        result = response.json()
+
+        if isinstance(result, list):
+            return result[0].get("generated_text", "").strip()
+
+        if isinstance(result, dict) and "generated_text" in result:
+            return result["generated_text"].strip()
+
+        return None
+
+    except Exception as e:
+        print("HF failed:", e)
+        return None
+
+# --------------------------
+# TTS
+# --------------------------
 async def generate_tts(text: str, output_file: str):
     audio_stream = eleven_client.text_to_speech.convert(
         voice_id=ELEVENLABS_VOICE_ID,
@@ -77,143 +114,94 @@ async def generate_tts(text: str, output_file: str):
         for chunk in audio_stream:
             f.write(chunk)
 
+# --------------------------
+# Video Helper
+# --------------------------
 def get_celebrity_video(celebrity_name: str):
     input_video_dir = os.path.join(BASE_DIR, "backend", "input")
     celebrity_video = os.path.join(input_video_dir, f"{celebrity_name.lower()}.mp4")
-    
+
     if os.path.exists(celebrity_video):
-        print(f"🎬 Using celebrity video: {celebrity_video}")
         return celebrity_video
     else:
-        # Fallback to default video (modi.mp4)
-        input_video = os.path.join(input_video_dir, "modi.mp4")
-        print(f"🎬 Using default video: {input_video}")
-        return input_video
+        return os.path.join(input_video_dir, "modi.mp4")
 
 # --------------------------
-# Serve Files
+# Job Status
 # --------------------------
-
-base_output_path = os.path.join(BASE_DIR, "outputs")
-video_output_path = os.path.join(base_output_path, "video")
-text_output_path = os.path.join(base_output_path, "text")
-
-os.makedirs(video_output_path, exist_ok=True)
-os.makedirs(text_output_path, exist_ok=True)
-
-app.mount("/video-stream", StaticFiles(directory=video_output_path), name="video-stream")
-app.mount("/transcript-stream", StaticFiles(directory=text_output_path), name="transcript-stream")
-
-# --------------------------
-# Root Route
-# --------------------------
-@app.get("/")
-def home():
-    return {"message": "AI Lesson Generator Backend Running"}
-
-@app.get("/transcript/{filename}")
-def get_transcript(filename: str):
-    file_path = os.path.join(BASE_DIR, "outputs", "text", filename)
-    if os.path.exists(file_path):
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        return {"content": content}
-    return {"error": "Transcript not found"}
-
-@app.get("/status/{job_id}")
-def get_status(job_id: str):
-    status_data = job_status.get(job_id, {"status": "not_found"})
-    # Backward compat: handle old string-based entries
-    if isinstance(status_data, str):
-        return {"status": status_data}
-    return status_data
-
-# --------------------------
-# Generate Lesson Endpoint
-# --------------------------
-
 job_status = {}
 
+# --------------------------
+# API Endpoint
+# --------------------------
 @app.post("/generate")
 def generate_lesson(data: LessonRequest, background_tasks: BackgroundTasks):
-    # Generate filename here so we can return it immediately
+
     topic_clean = re.sub(r'[^\w\s-]', '', data.topic).strip().replace(" ", "_")
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     base_filename = f"{topic_clean}_{timestamp}"
-    
+
     job_status[base_filename] = {"status": "processing"}
 
-    # Run as a background task to avoid timeout issues
     background_tasks.add_task(process_lesson, data, base_filename)
-    
+
     return {
         "status": "Processing",
-        "filename": f"{base_filename}.mp4",
-        "text_file": f"{base_filename}.txt",
-        "audio_file": f"{base_filename}.mp3",
         "jobId": base_filename
     }
 
 # --------------------------
-# Background Task Logic
+# Main Processing
 # --------------------------
 def process_lesson(data: LessonRequest, base_filename: str):
-    print("\n📥 RAW REQUEST DATA:")
-    print(data.dict())
-    try:
-        print(f"\n🚀 Starting generation for: {data.topic} ({data.celebrity})")
 
-        #  Build preference context
+    try:
+        print(f"\n🚀 Generating lesson: {data.topic}")
+
+        # --------------------------
+        # Preferences
+        # --------------------------
         preferences_text = ""
 
         if data.preferences:
             preferences_text = f"""
-        User Preferences:
-        - Learning Goal: {data.preferences.get("learning_goal", "Not specified")}
-        - Interested Topics: {", ".join(data.preferences.get("interested_topics", [])) if isinstance(data.preferences.get("interested_topics"), list) else data.preferences.get("interested_topics", "Not specified")}
-        - Experience Level: {data.preferences.get("experience_level", "Not specified")}
-        - Weekly Commitment: {data.preferences.get("weekly_commitment", "Not specified")}
-        - Learning Style: {data.preferences.get("learning_style", "Not specified")}
-        """
-        else:
-            preferences_text = "User Preferences: Not provided"
+User Preferences:
+- Learning Goal: {data.preferences.get("learning_goal", "Not specified")}
+- Interested Topics: {data.preferences.get("interested_topics", "Not specified")}
+- Experience Level: {data.preferences.get("experience_level", "Not specified")}
+- Weekly Commitment: {data.preferences.get("weekly_commitment", "Not specified")}
+- Learning Style: {data.preferences.get("learning_style", "Not specified")}
+"""
 
-        # 🎯 Final Prompt
+        # --------------------------
+        # Prompt
+        # --------------------------
         prompt = f"""
-        Create a 50 word educational explanation about '{data.topic}' in the subject '{data.course}'.
+Create a 50-word educational explanation about '{data.topic}' in '{data.course}'.
 
-        Rules:
-        - 100% English only
-        - No Hindi
-        - No Hinglish
-        - Simple classroom teaching tone
-        - Between 45 and 60 words
+Rules:
+- English only
+- Simple classroom tone
+- 45–60 words
+- Inspired by {data.celebrity}
 
-        Narration style inspired by the celebrity {data.celebrity}.
+{preferences_text}
+"""
 
-        {preferences_text}
+        # --------------------------
+        # HUGGING FACE ONLY AI
+        # --------------------------
+        script = call_huggingface(prompt)
 
-        Instructions:
-        - Adapt explanation based on user's experience level
-        - Adjust depth based on learning goal
-        - Match explanation style with preferred learning style
-        """
-        print("\n📊 USER PREFERENCES:\n")
-        print(data.preferences if data.preferences else "No preferences provided")
+        if not script:
+            script = "AI failed to generate content"
 
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt
-            )
-            script = response.text.strip().replace("\n", " ")
-            print(f"📝 Generated text: {script}")
-        except Exception as e:
-            print(f"❌ Gemini Error: {e}")
-            return
+        print("🧠 Hugging Face generated script")
+        print(f"📝 Script: {script}")
 
-        # 2️⃣ Create Output Folders
-
+        # --------------------------
+        # File Setup
+        # --------------------------
         base_output_dir = os.path.join(BASE_DIR, "outputs")
         text_dir = os.path.join(base_output_dir, "text")
         audio_dir = os.path.join(base_output_dir, "audio")
@@ -227,30 +215,31 @@ def process_lesson(data: LessonRequest, base_filename: str):
         audio_path = os.path.join(audio_dir, f"{base_filename}.mp3")
         final_video = os.path.join(video_dir, f"{base_filename}.mp4")
 
-        # 3️⃣ Save Text to File
+        # --------------------------
+        # Save Text
+        # --------------------------
         with open(text_path, "w", encoding="utf-8") as f:
             f.write(script)
-        print(f"💾 Saved text to: {text_path}")
 
-        # 4️⃣ Convert Text to Speech (edge-tts)
-        print("🎵 Starting TTS generation...")
+        # --------------------------
+        # TTS
+        # --------------------------
         try:
             if os.path.exists(audio_path):
                 os.remove(audio_path)
 
             asyncio.run(generate_tts(script, audio_path))
-            print(f"✅ Audio saved: {audio_path}")
+
         except Exception as e:
-            print(f"❌ TTS Error: {e}")
+            print("❌ TTS failed:", e)
+            job_status[base_filename] = {"status": "failed"}
             return
 
-        # 5️⃣ Select Video
+        # --------------------------
+        # Video Merge
+        # --------------------------
         input_video = get_celebrity_video(data.celebrity)
-        if not os.path.exists(input_video):
-            print(f"❌ Error: Video file not found at {input_video}")
-            return
 
-        # 6️⃣ Merge Video + Audio (FFmpeg)
         ffmpeg_command = (
             f'ffmpeg -y -stream_loop -1 -i "{input_video}" '
             f'-i "{audio_path}" '
@@ -258,41 +247,23 @@ def process_lesson(data: LessonRequest, base_filename: str):
             f'-c:v copy -c:a aac -shortest "{final_video}"'
         )
 
-        print(f"🎥 Running ffmpeg command...")
         os.system(ffmpeg_command)
 
         if not os.path.exists(final_video):
-            print(f"❌ FFmpeg failed — video file not found at {final_video}")
             job_status[base_filename] = {"status": "failed"}
             return
 
-        # 7️⃣ Upload to Cloudinary
-        cloudinary_url = None
-        try:
-            print(f"☁️ Uploading video to Cloudinary...")
-            upload_result = cloudinary.uploader.upload(
-                final_video,
-                resource_type="video",
-                folder="ai_mentor/videos",
-                public_id=base_filename,
-                overwrite=True,
-                chunk_size=6000000,  # 6 MB chunks for large files
-            )
-            cloudinary_url = upload_result.get("secure_url")
-            print(f"✅ Cloudinary upload success: {cloudinary_url}")
-        except Exception as cloud_err:
-            print(f"⚠️ Cloudinary upload failed (will fall back to local proxy): {cloud_err}")
-
+        # --------------------------
+        # Status Update
+        # --------------------------
         job_status[base_filename] = {
             "status": "ready",
-            "cloudinary_url": cloudinary_url,  # None if upload failed
+            "video": final_video
         }
-        print(f"✅ Lesson ready!")
-        print(f"   Video : {final_video}")
-        if cloudinary_url:
-            print(f"   Cloud : {cloudinary_url}")
+
+        print("✅ Lesson completed")
 
     except Exception as e:
-        job_status[base_filename] = {"status": "failed"}  # 👈 mark failed on error
-        print(f"❌ Error generating lesson: {e}")
+        job_status[base_filename] = {"status": "failed"}
+        print("❌ Error:", e)
         traceback.print_exc()
