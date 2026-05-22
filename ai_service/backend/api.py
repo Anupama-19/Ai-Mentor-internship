@@ -5,7 +5,7 @@ import datetime
 import re
 import traceback
 import asyncio
-import edge_tts
+from elevenlabs.client import ElevenLabs
 import cloudinary
 import cloudinary.uploader
 from fastapi import FastAPI, BackgroundTasks
@@ -18,6 +18,8 @@ from config import (
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET,
+    ELEVENLABS_API_KEY,
+    ELEVENLABS_VOICE_ID,
 )
 
 # --------------------------
@@ -47,7 +49,9 @@ app.add_middleware(
 # Gemini Client
 # --------------------------
 client = genai.Client(api_key=GEMINI_API_KEY)
-
+eleven_client = ElevenLabs(
+    api_key=ELEVENLABS_API_KEY
+)
 # --------------------------
 # Request Model
 # --------------------------
@@ -63,13 +67,15 @@ class LessonRequest(BaseModel):
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 async def generate_tts(text: str, output_file: str):
-    communicate = edge_tts.Communicate(
-        text=text,
-        voice="en-US-GuyNeural",
-        rate="+0%",
-        pitch="+0Hz"
+    audio_stream = eleven_client.text_to_speech.convert(
+        voice_id=ELEVENLABS_VOICE_ID,
+        model_id="eleven_multilingual_v2",
+        text=text
     )
-    await communicate.save(output_file)
+
+    with open(output_file, "wb") as f:
+        for chunk in audio_stream:
+            f.write(chunk)
 
 def get_celebrity_video(celebrity_name: str):
     input_video_dir = os.path.join(BASE_DIR, "backend", "input")
